@@ -403,48 +403,22 @@ func TestExecutionManager_UpdateWorkflowExecution(t *testing.T) {
 
 	manager := NewExecutionManagerImpl(mockedStore, testlogger.New(t), mockedSerializer)
 
-	info := sampleWorkflowExecutionInfo()
-	info.CompletionEvent = &types.HistoryEvent{
-		ID:        1,
-		EventType: types.EventTypeWorkflowExecutionCompleted.Ptr(),
-	}
-	info.AutoResetPoints = &types.ResetPoints{
-		Points: []*types.ResetPointInfo{
-			{
-				BinaryChecksum: "test-checksum",
-			},
-		},
-	}
-
 	expectedInfo := sampleInternalWorkflowMutation()
-	expectedInfo.ExecutionInfo.AutoResetPoints = &DataBlob{
-		Encoding: common.EncodingTypeThriftRW,
-		Data:     []byte("test-reset-points"),
-	}
-	expectedInfo.ExecutionInfo.CompletionEvent = &DataBlob{
-		Encoding: common.EncodingTypeThriftRW,
-		Data:     []byte("test-event"),
-	}
-	expectedInfo.ChecksumData = sampleCheckSumData()
-	expectedInfo.StartVersion = common.EmptyVersion
-	expectedInfo.LastWriteVersion = common.EmptyVersion
-	expectedInfo.UpsertActivityInfos = []*InternalActivityInfo{}
-	expectedInfo.UpsertChildExecutionInfos = []*InternalChildExecutionInfo{}
 
-	mockedSerializer.EXPECT().SerializeEvent(info.CompletionEvent, common.EncodingTypeThriftRW).Return(expectedInfo.ExecutionInfo.CompletionEvent, nil).Times(2)
-	mockedSerializer.EXPECT().SerializeResetPoints(info.AutoResetPoints, common.EncodingTypeThriftRW).Return(expectedInfo.ExecutionInfo.AutoResetPoints, nil).Times(2)
+	mockedSerializer.EXPECT().SerializeEvent(completionEvent(), common.EncodingTypeThriftRW).Return(expectedInfo.ExecutionInfo.CompletionEvent, nil).Times(2)
+	mockedSerializer.EXPECT().SerializeEvent(activityStartedEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+	mockedSerializer.EXPECT().SerializeEvent(activityScheduledEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+	mockedSerializer.EXPECT().SerializeEvent(childWorkflowScheduledEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+	mockedSerializer.EXPECT().SerializeEvent(childWorkflowStartedEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+	mockedSerializer.EXPECT().SerializeResetPoints(generateResetPoints(), common.EncodingTypeThriftRW).Return(expectedInfo.ExecutionInfo.AutoResetPoints, nil).Times(2)
 
 	request := &UpdateWorkflowExecutionRequest{
-		RangeID: 1,
-		Mode:    UpdateWorkflowModeBypassCurrent,
-		UpdateWorkflowMutation: WorkflowMutation{
-			ExecutionInfo:  info,
-			ExecutionStats: &ExecutionStats{},
-			Checksum:       generateChecksum(),
-		},
-		Encoding: common.EncodingTypeThriftRW,
+		RangeID:                1,
+		Mode:                   UpdateWorkflowModeBypassCurrent,
+		UpdateWorkflowMutation: *sampleWorkflowMutation(),
+		Encoding:               common.EncodingTypeThriftRW,
 		NewWorkflowSnapshot: &WorkflowSnapshot{
-			ExecutionInfo: info,
+			ExecutionInfo: sampleWorkflowExecutionInfo(),
 			ExecutionStats: &ExecutionStats{
 				HistorySize: 1024,
 			},
@@ -452,7 +426,6 @@ func TestExecutionManager_UpdateWorkflowExecution(t *testing.T) {
 		},
 	}
 
-	expectedInfo.Checksum = request.UpdateWorkflowMutation.Checksum
 	mockedSerializer.EXPECT().SerializeChecksum(request.UpdateWorkflowMutation.Checksum, common.EncodingTypeJSON).Return(expectedInfo.ChecksumData, nil).Times(2)
 
 	expectedRequest := &InternalUpdateWorkflowExecutionRequest{
@@ -471,8 +444,14 @@ func TestExecutionManager_UpdateWorkflowExecution(t *testing.T) {
 	res, err := manager.UpdateWorkflowExecution(context.Background(), request)
 	assert.NoError(t, err)
 	stats := &MutableStateUpdateSessionStats{
-		MutableStateSize:  40,
+		MutableStateSize:  90,
 		ExecutionInfoSize: 40,
+		ActivityInfoSize:  20,
+		TimerInfoSize:     10,
+		ChildInfoSize:     20,
+		ActivityInfoCount: 1,
+		TimerInfoCount:    2,
+		ChildInfoCount:    1,
 	}
 	assert.Equal(t, stats, res.MutableStateUpdateSessionStats)
 }
@@ -875,6 +854,398 @@ func TestDeserializeChildExecutionInfos(t *testing.T) {
 	}
 }
 
+func TestListConcreteExecutions(t *testing.T) {
+	request := &ListConcreteExecutionsRequest{
+		PageSize:  10,
+		PageToken: []byte("next"),
+	}
+
+	internalResponse := &InternalListConcreteExecutionsResponse{
+		Executions: []*InternalListConcreteExecutionsEntity{
+			{
+				ExecutionInfo:    sampleInternalWorkflowExecutionInfo(),
+				VersionHistories: sampleEventData(),
+			},
+		},
+		NextPageToken: []byte("next"),
+	}
+
+	testCases := []struct {
+		name         string
+		prepareMocks func(*MockExecutionStore, *MockPayloadSerializer)
+		checkRes     func(*testing.T, *ListConcreteExecutionsResponse, error)
+	}{
+		{
+			name: "success",
+			prepareMocks: func(mockedStore *MockExecutionStore, mockedSerializer *MockPayloadSerializer) {
+				mockedStore.EXPECT().ListConcreteExecutions(gomock.Any(), request).Return(internalResponse, nil)
+
+				mockedSerializer.EXPECT().DeserializeEvent(internalResponse.Executions[0].ExecutionInfo.CompletionEvent).Return(completionEvent(), nil)
+				mockedSerializer.EXPECT().DeserializeResetPoints(internalResponse.Executions[0].ExecutionInfo.AutoResetPoints).Return(&types.ResetPoints{
+					Points: []*types.ResetPointInfo{
+						{
+							RunID: testRunID,
+						},
+					},
+				}, nil)
+
+				mockedSerializer.EXPECT().DeserializeVersionHistories(internalResponse.Executions[0].VersionHistories).Return(&types.VersionHistories{
+					CurrentVersionHistoryIndex: 1,
+					Histories: []*types.VersionHistory{
+						{
+							BranchToken: []byte("branch-token-1"),
+							Items: []*types.VersionHistoryItem{
+								{
+									EventID: 1,
+									Version: 1,
+								},
+							},
+						},
+						{
+							BranchToken: []byte("branch-token-2"),
+							Items: []*types.VersionHistoryItem{
+								{
+									EventID: 2,
+									Version: 1,
+								},
+								{
+									EventID: 3,
+									Version: 2,
+								},
+							},
+						},
+					},
+				}, nil)
+			},
+			checkRes: func(t *testing.T, response *ListConcreteExecutionsResponse, err error) {
+				executionInfo := sampleWorkflowExecutionInfo()
+				executionInfo.CompletionEvent = completionEvent()
+				executionInfo.AutoResetPoints = &types.ResetPoints{
+					Points: []*types.ResetPointInfo{
+						{
+							RunID: testRunID,
+						},
+					},
+				}
+				assert.Equal(t, &ListConcreteExecutionsResponse{
+					Executions: []*ListConcreteExecutionsEntity{
+						{
+							ExecutionInfo: executionInfo,
+							VersionHistories: &VersionHistories{
+								CurrentVersionHistoryIndex: 1,
+								Histories: []*VersionHistory{
+									{
+										BranchToken: []byte("branch-token-1"),
+										Items: []*VersionHistoryItem{
+											{
+												EventID: 1,
+												Version: 1,
+											},
+										},
+									},
+									{
+										BranchToken: []byte("branch-token-2"),
+										Items: []*VersionHistoryItem{
+											{
+												EventID: 2,
+												Version: 1,
+											},
+											{
+												EventID: 3,
+												Version: 2,
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					PageToken: []byte("next"),
+				}, response)
+			},
+		},
+		{
+			name: "persistence error",
+			prepareMocks: func(mockedStore *MockExecutionStore, mockedSerializer *MockPayloadSerializer) {
+				mockedStore.EXPECT().ListConcreteExecutions(gomock.Any(), request).Return(nil, assert.AnError)
+			},
+			checkRes: func(t *testing.T, response *ListConcreteExecutionsResponse, err error) {
+				assert.ErrorIs(t, err, assert.AnError)
+			},
+		},
+		{
+			name: "deserialize execution info error",
+			prepareMocks: func(mockedStore *MockExecutionStore, mockedSerializer *MockPayloadSerializer) {
+				mockedStore.EXPECT().ListConcreteExecutions(gomock.Any(), request).Return(internalResponse, nil)
+				mockedSerializer.EXPECT().DeserializeEvent(internalResponse.Executions[0].ExecutionInfo.CompletionEvent).Return(nil, assert.AnError)
+			},
+			checkRes: func(t *testing.T, response *ListConcreteExecutionsResponse, err error) {
+				assert.ErrorIs(t, err, assert.AnError)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockedStore := NewMockExecutionStore(ctrl)
+			mockedSerializer := NewMockPayloadSerializer(ctrl)
+
+			tc.prepareMocks(mockedStore, mockedSerializer)
+
+			manager := NewExecutionManagerImpl(mockedStore, testlogger.New(t), mockedSerializer)
+
+			res, err := manager.ListConcreteExecutions(context.Background(), request)
+
+			tc.checkRes(t, res, err)
+		})
+	}
+}
+
+func TestCreateWorkflowExecution(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		prepareMocks func(*MockExecutionStore, *MockPayloadSerializer)
+		checkRes     func(*testing.T, *CreateWorkflowExecutionResponse, error)
+	}{
+		{
+			name: "success",
+			prepareMocks: func(mockedStore *MockExecutionStore, mockedSerializer *MockPayloadSerializer) {
+				// Prepare CreateWorkflow call
+				mockedStore.EXPECT().CreateWorkflowExecution(gomock.Any(), &InternalCreateWorkflowExecutionRequest{
+					RangeID:                  1,
+					Mode:                     CreateWorkflowModeWorkflowIDReuse,
+					PreviousRunID:            testRunID,
+					PreviousLastWriteVersion: 1,
+					NewWorkflowSnapshot:      *sampleInternalWorkflowSnapshot(),
+					WorkflowRequestMode:      CreateWorkflowRequestModeReplicated,
+				}).Return(nil, nil)
+
+				// Prepare DeserializeWorkflow call
+				mockedSerializer.EXPECT().SerializeEvent(completionEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeResetPoints(gomock.Any(), gomock.Any()).Return(sampleResetPointsData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeVersionHistories(gomock.Any(), gomock.Any()).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(activityScheduledEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(activityStartedEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(childWorkflowScheduledEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(childWorkflowStartedEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeChecksum(gomock.Any(), gomock.Any()).Return(sampleCheckSumData(), nil).Times(1)
+			},
+			checkRes: func(t *testing.T, response *CreateWorkflowExecutionResponse, err error) {
+				assert.Equal(t, &CreateWorkflowExecutionResponse{
+					MutableStateUpdateSessionStats: &MutableStateUpdateSessionStats{
+						MutableStateSize:  91,
+						ExecutionInfoSize: 20,
+						ActivityInfoSize:  29,
+						TimerInfoSize:     22,
+						ChildInfoSize:     20,
+						ActivityInfoCount: 1,
+						TimerInfoCount:    2,
+						ChildInfoCount:    1,
+					},
+				}, response)
+			},
+		},
+		{
+			name: "persistence error",
+			prepareMocks: func(mockedStore *MockExecutionStore, mockedSerializer *MockPayloadSerializer) {
+				// Prepare DeserializeWorkflow call
+				mockedSerializer.EXPECT().SerializeEvent(completionEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeResetPoints(gomock.Any(), gomock.Any()).Return(sampleResetPointsData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeVersionHistories(gomock.Any(), gomock.Any()).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(activityScheduledEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(activityStartedEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(childWorkflowScheduledEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(childWorkflowStartedEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeChecksum(gomock.Any(), gomock.Any()).Return(sampleCheckSumData(), nil).Times(1)
+
+				// Persistence call will fail
+				mockedStore.EXPECT().CreateWorkflowExecution(gomock.Any(), gomock.Any()).Return(nil, assert.AnError)
+			},
+			checkRes: func(t *testing.T, response *CreateWorkflowExecutionResponse, err error) {
+				assert.ErrorIs(t, err, assert.AnError)
+			},
+		},
+		{
+			name: "serialize workflow snapshot error",
+			prepareMocks: func(mockedStore *MockExecutionStore, mockedSerializer *MockPayloadSerializer) {
+				mockedSerializer.EXPECT().SerializeEvent(completionEvent(), common.EncodingTypeThriftRW).Return(nil, assert.AnError).Times(1)
+			},
+			checkRes: func(t *testing.T, response *CreateWorkflowExecutionResponse, err error) {
+				assert.ErrorIs(t, err, assert.AnError)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockedStore := NewMockExecutionStore(ctrl)
+			mockedSerializer := NewMockPayloadSerializer(ctrl)
+
+			tc.prepareMocks(mockedStore, mockedSerializer)
+
+			request := &CreateWorkflowExecutionRequest{
+				RangeID:                  1,
+				Mode:                     CreateWorkflowModeWorkflowIDReuse,
+				PreviousRunID:            testRunID,
+				PreviousLastWriteVersion: 1,
+				NewWorkflowSnapshot:      *sampleWorkflowSnapshot(),
+				WorkflowRequestMode:      CreateWorkflowRequestModeReplicated,
+			}
+
+			manager := NewExecutionManagerImpl(mockedStore, testlogger.New(t), mockedSerializer)
+
+			res, err := manager.CreateWorkflowExecution(context.Background(), request)
+
+			tc.checkRes(t, res, err)
+		})
+	}
+}
+
+func TestConflictResolveWorkflowExecution(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		request      *ConflictResolveWorkflowExecutionRequest
+		prepareMocks func(*MockExecutionStore, *MockPayloadSerializer)
+		checkRes     func(*testing.T, *ConflictResolveWorkflowExecutionResponse, error)
+	}{
+		{
+			name: "only snapshot",
+			request: &ConflictResolveWorkflowExecutionRequest{
+				RangeID:               1,
+				Mode:                  ConflictResolveWorkflowModeBypassCurrent,
+				ResetWorkflowSnapshot: *sampleWorkflowSnapshot(),
+				Encoding:              common.EncodingTypeThriftRW,
+			},
+			prepareMocks: func(mockedStore *MockExecutionStore, mockedSerializer *MockPayloadSerializer) {
+				mockedStore.EXPECT().ConflictResolveWorkflowExecution(gomock.Any(), &InternalConflictResolveWorkflowExecutionRequest{
+					RangeID:               1,
+					Mode:                  ConflictResolveWorkflowModeBypassCurrent,
+					ResetWorkflowSnapshot: *sampleInternalWorkflowSnapshot(),
+				}).Return(nil)
+
+				mockedSerializer.EXPECT().SerializeEvent(completionEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeResetPoints(gomock.Any(), gomock.Any()).Return(sampleResetPointsData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeVersionHistories(gomock.Any(), gomock.Any()).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(activityScheduledEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(activityStartedEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(childWorkflowScheduledEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(childWorkflowStartedEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeChecksum(gomock.Any(), gomock.Any()).Return(sampleCheckSumData(), nil).Times(1)
+			},
+			checkRes: func(t *testing.T, response *ConflictResolveWorkflowExecutionResponse, err error) {
+				assert.NoError(t, err)
+				assert.Equal(t, &ConflictResolveWorkflowExecutionResponse{
+					MutableStateUpdateSessionStats: &MutableStateUpdateSessionStats{
+						MutableStateSize:  91,
+						ExecutionInfoSize: 20,
+						ActivityInfoSize:  29,
+						TimerInfoSize:     22,
+						ChildInfoSize:     20,
+						ActivityInfoCount: 1,
+						TimerInfoCount:    2,
+						ChildInfoCount:    1,
+					},
+				}, response)
+			},
+		},
+		{
+			name: "only snapshot fail",
+			request: &ConflictResolveWorkflowExecutionRequest{
+				RangeID:               1,
+				Mode:                  ConflictResolveWorkflowModeBypassCurrent,
+				ResetWorkflowSnapshot: *sampleWorkflowSnapshot(),
+				Encoding:              common.EncodingTypeThriftRW,
+			},
+			prepareMocks: func(mockedStore *MockExecutionStore, mockedSerializer *MockPayloadSerializer) {
+				mockedSerializer.EXPECT().SerializeEvent(completionEvent(), common.EncodingTypeThriftRW).Return(nil, assert.AnError).Times(1)
+			},
+			checkRes: func(t *testing.T, response *ConflictResolveWorkflowExecutionResponse, err error) {
+				assert.ErrorIs(t, err, assert.AnError)
+			},
+		},
+		{
+			name: "current workflow mutation",
+			request: &ConflictResolveWorkflowExecutionRequest{
+				RangeID:                 1,
+				Mode:                    ConflictResolveWorkflowModeBypassCurrent,
+				ResetWorkflowSnapshot:   *sampleWorkflowSnapshot(),
+				Encoding:                common.EncodingTypeThriftRW,
+				CurrentWorkflowMutation: sampleWorkflowMutation(),
+			},
+			prepareMocks: func(mockedStore *MockExecutionStore, mockedSerializer *MockPayloadSerializer) {
+				mockedStore.EXPECT().ConflictResolveWorkflowExecution(gomock.Any(), gomock.Any()).DoAndReturn(func(ctx context.Context, request *InternalConflictResolveWorkflowExecutionRequest) error {
+					assert.Equal(t, &InternalConflictResolveWorkflowExecutionRequest{
+						RangeID:                 1,
+						Mode:                    ConflictResolveWorkflowModeBypassCurrent,
+						ResetWorkflowSnapshot:   *sampleInternalWorkflowSnapshot(),
+						CurrentWorkflowMutation: sampleInternalWorkflowMutation(),
+					}, request)
+					return nil
+				})
+
+				// Mutation call
+				mockedSerializer.EXPECT().SerializeEvent(activityStartedEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(activityScheduledEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeResetPoints(gomock.Any(), gomock.Any()).Return(sampleResetPointsData(), nil).Times(1)
+
+				// Expect mutation doubles the calls for workflow execution serialization
+				mockedSerializer.EXPECT().SerializeEvent(completionEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(2)
+				mockedSerializer.EXPECT().SerializeResetPoints(gomock.Any(), gomock.Any()).Return(sampleResetPointsData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeVersionHistories(gomock.Any(), gomock.Any()).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(activityScheduledEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(2)
+				mockedSerializer.EXPECT().SerializeEvent(activityStartedEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(2)
+				mockedSerializer.EXPECT().SerializeEvent(childWorkflowScheduledEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeEvent(childWorkflowStartedEvent(), common.EncodingTypeThriftRW).Return(sampleEventData(), nil).Times(1)
+				mockedSerializer.EXPECT().SerializeChecksum(gomock.Any(), gomock.Any()).Return(sampleCheckSumData(), nil).Times(2)
+			},
+			checkRes: func(t *testing.T, response *ConflictResolveWorkflowExecutionResponse, err error) {
+				assert.NoError(t, err)
+				assert.Equal(t, &ConflictResolveWorkflowExecutionResponse{
+					MutableStateUpdateSessionStats: &MutableStateUpdateSessionStats{
+						MutableStateSize:  161,
+						ExecutionInfoSize: 40,
+						ActivityInfoSize:  49,
+						TimerInfoSize:     32,
+						ChildInfoSize:     40,
+						ActivityInfoCount: 2,
+						TimerInfoCount:    6,
+						ChildInfoCount:    2,
+					},
+				}, response)
+			},
+		},
+		{
+			name: "new workflow snapshot",
+			request: &ConflictResolveWorkflowExecutionRequest{
+				RangeID:               1,
+				Mode:                  ConflictResolveWorkflowModeBypassCurrent,
+				ResetWorkflowSnapshot: *sampleWorkflowSnapshot(),
+				Encoding:              common.EncodingTypeThriftRW,
+			},
+			prepareMocks: func(mockedStore *MockExecutionStore, mockedSerializer *MockPayloadSerializer) {
+				mockedSerializer.EXPECT().SerializeEvent(completionEvent(), common.EncodingTypeThriftRW).Return(nil, assert.AnError).Times(1)
+			},
+			checkRes: func(t *testing.T, response *ConflictResolveWorkflowExecutionResponse, err error) {
+				assert.ErrorIs(t, err, assert.AnError)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			mockedStore := NewMockExecutionStore(ctrl)
+			mockedSerializer := NewMockPayloadSerializer(ctrl)
+
+			tc.prepareMocks(mockedStore, mockedSerializer)
+
+			manager := NewExecutionManagerImpl(mockedStore, testlogger.New(t), mockedSerializer)
+
+			res, err := manager.ConflictResolveWorkflowExecution(context.Background(), tc.request)
+
+			tc.checkRes(t, res, err)
+		})
+	}
+}
+
 func sampleInternalActivityInfo(name string) *InternalActivityInfo {
 	return &InternalActivityInfo{
 		Version:        1,
@@ -939,22 +1310,62 @@ func sampleWorkflowExecutionInfo() *WorkflowExecutionInfo {
 		WorkflowTypeName:                   testWorkflowType,
 		NextEventID:                        10,
 		CompletionEvent:                    completionEvent(),
+		AutoResetPoints:                    generateResetPoints(),
 	}
 }
 
 func sampleInternalWorkflowMutation() *InternalWorkflowMutation {
 	return &InternalWorkflowMutation{
-		ExecutionInfo: &InternalWorkflowExecutionInfo{
-			DomainID:                           testDomain,
-			WorkflowTimeout:                    wfTimeout,
-			DecisionStartToCloseTimeout:        decisionTimeout,
-			DecisionStartedTimestamp:           startedTimestamp,
-			DecisionScheduledTimestamp:         scheduledTimestamp,
-			DecisionOriginalScheduledTimestamp: originalScheduledTimestamp,
-			WorkflowID:                         testWorkflowID,
-			RunID:                              testRunID,
-			WorkflowTypeName:                   testWorkflowType,
-			NextEventID:                        10,
+		ExecutionInfo: sampleInternalWorkflowExecutionInfo(),
+		UpsertActivityInfos: []*InternalActivityInfo{
+			{
+				Version:        1,
+				ScheduledEvent: sampleEventData(),
+				StartedEvent:   sampleEventData(),
+			},
+		},
+		UpsertTimerInfos: []*TimerInfo{
+			{
+				TimerID: "test-timer",
+			},
+		},
+		UpsertChildExecutionInfos: []*InternalChildExecutionInfo{
+			{
+				DomainID:         testDomainID,
+				WorkflowTypeName: testWorkflowType,
+				Version:          1,
+				InitiatedEvent:   sampleEventData(),
+				StartedEvent:     sampleEventData(),
+			},
+		},
+		Checksum:         generateChecksum(),
+		ChecksumData:     sampleTestCheckSumData(),
+		StartVersion:     common.EmptyVersion,
+		LastWriteVersion: common.EmptyVersion,
+	}
+}
+
+func sampleWorkflowMutation() *WorkflowMutation {
+	return &WorkflowMutation{
+		ExecutionInfo:  sampleWorkflowExecutionInfo(),
+		ExecutionStats: sampleWorkflowExecutionStats(),
+		UpsertActivityInfos: []*ActivityInfo{
+			{
+				Version:        1,
+				ScheduledEvent: activityScheduledEvent(),
+				StartedEvent:   activityStartedEvent(),
+			},
+		},
+		UpsertTimerInfos: []*TimerInfo{{TimerID: "test-timer"}},
+		Checksum:         generateChecksum(),
+		UpsertChildExecutionInfos: []*ChildExecutionInfo{
+			{
+				DomainID:         testDomainID,
+				WorkflowTypeName: testWorkflowType,
+				Version:          1,
+				InitiatedEvent:   childWorkflowScheduledEvent(),
+				StartedEvent:     childWorkflowStartedEvent(),
+			},
 		},
 	}
 }

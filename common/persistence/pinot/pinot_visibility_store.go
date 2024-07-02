@@ -62,6 +62,9 @@ const (
 	IsDeleted            = "IsDeleted"   // used for Pinot deletion/rolling upsert only, not visible to user
 	EventTimeMs          = "EventTimeMs" // used for Pinot deletion/rolling upsert only, not visible to user
 	Memo                 = "Memo"
+	WfIDTextSearch       = "WorkflowIDTextSearch"   // used for text search which can improve the partial match performance on WorkflowID/RunID/WorkflowType text search columns
+	WfTypeTextSearch     = "WorkflowTypeTextSearch" // used for text search which can improve the partial match performance on WorkflowID/RunID/WorkflowType text search columns
+	RunIDTextSearch      = "RunIDTextSearch"        // used for text search which can improve the partial match performance on WorkflowID/RunID/WorkflowType text search columns
 
 	// used to be micro second
 	oneMicroSecondInNano = int64(time.Microsecond / time.Nanosecond)
@@ -615,7 +618,10 @@ func createVisibilityMessage(
 	m[UpdateTime] = updateTimeUnixMilli
 	m[ShardID] = shardID
 	m[IsDeleted] = isDeleted
-	m[EventTimeMs] = updateTimeUnixMilli // same as update time when record is upserted, could not use updateTime directly since this will be modified by Pinot
+	m[EventTimeMs] = updateTimeUnixMilli   // same as update time when record is upserted, could not use updateTime directly since this will be modified by Pinot
+	m[WfIDTextSearch] = wid                // used for text search which can improve the partial match performance
+	m[RunIDTextSearch] = rid               // used for text search which can improve the partial match performance
+	m[WfTypeTextSearch] = workflowTypeName // used for text search which can improve the partial match performance
 
 	SearchAttributes := make(map[string]interface{})
 	var err error
@@ -708,6 +714,10 @@ func (s *PinotQuerySearchField) lastSearchField() {
 	}
 }
 
+func (s *PinotQuerySearchField) resetSearchField() {
+	s.string = ""
+}
+
 func (s *PinotQuerySearchField) addEqual(obj string, val interface{}) {
 	s.checkFirstSearchField()
 	if _, ok := val.(string); ok {
@@ -764,6 +774,16 @@ func (q *PinotQuery) addPinotSorter(orderBy string, order string) {
 
 func (q *PinotQuery) addOffsetAndLimits(offset int, limit int) {
 	q.limits += fmt.Sprintf("LIMIT %d, %d\n", offset, limit)
+}
+
+func (q *PinotQuery) addStatusFilters(status []types.WorkflowExecutionCloseStatus) {
+	for _, s := range status {
+		q.search.addEqual(CloseStatus, s.String())
+	}
+
+	q.search.lastSearchField()
+	q.filters.addQuery(q.search.string)
+	q.search.resetSearchField()
 }
 
 func (f *PinotQueryFilter) checkFirstFilter() {
@@ -1067,6 +1087,10 @@ func (v *pinotVisibilityStore) getListAllWorkflowExecutionsQuery(tableName strin
 	from := token.From
 	pageSize := request.PageSize
 	query.addOffsetAndLimits(from, pageSize)
+
+	if request.StatusFilter != nil {
+		query.addStatusFilters(request.StatusFilter)
+	}
 
 	if request.WorkflowSearchValue != "" {
 		if request.PartialMatch {

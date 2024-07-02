@@ -23,12 +23,11 @@ package handler
 import (
 	"context"
 	"errors"
-	"math/rand"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -36,13 +35,16 @@ import (
 	"go.uber.org/yarpc/yarpcerrors"
 
 	"github.com/uber/cadence/common"
-	"github.com/uber/cadence/common/cluster"
+	"github.com/uber/cadence/common/dynamicconfig"
 	"github.com/uber/cadence/common/log/testlogger"
 	"github.com/uber/cadence/common/membership"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/metrics/mocks"
 	"github.com/uber/cadence/common/persistence"
 	"github.com/uber/cadence/common/quotas"
+	"github.com/uber/cadence/common/quotas/global/algorithm"
+	"github.com/uber/cadence/common/quotas/global/rpc"
+	"github.com/uber/cadence/common/quotas/global/shared"
 	"github.com/uber/cadence/common/service"
 	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/history/config"
@@ -52,7 +54,6 @@ import (
 	"github.com/uber/cadence/service/history/failover"
 	"github.com/uber/cadence/service/history/resource"
 	"github.com/uber/cadence/service/history/shard"
-	"github.com/uber/cadence/service/history/task"
 	"github.com/uber/cadence/service/history/workflowcache"
 )
 
@@ -68,16 +69,15 @@ type (
 		suite.Suite
 		*require.Assertions
 
-		controller                   *gomock.Controller
-		mockResource                 *resource.Test
-		mockShardController          *shard.MockController
-		mockEngine                   *engine.MockEngine
-		mockWFCache                  *workflowcache.MockWFCache
-		mockTokenSerializer          *common.MockTaskTokenSerializer
-		mockHistoryEventNotifier     *events.MockNotifier
-		mockRatelimiter              *quotas.MockLimiter
-		mockCrossClusterTaskFetchers *task.MockFetcher
-		mockFailoverCoordinator      *failover.MockCoordinator
+		controller               *gomock.Controller
+		mockResource             *resource.Test
+		mockShardController      *shard.MockController
+		mockEngine               *engine.MockEngine
+		mockWFCache              *workflowcache.MockWFCache
+		mockTokenSerializer      *common.MockTaskTokenSerializer
+		mockHistoryEventNotifier *events.MockNotifier
+		mockRatelimiter          *quotas.MockLimiter
+		mockFailoverCoordinator  *failover.MockCoordinator
 
 		handler *handlerImpl
 	}
@@ -1245,19 +1245,6 @@ func (s *handlerSuite) TestRemoveTask() {
 				}).Return(nil).Once()
 			},
 		},
-		"cross cluster task": {
-			request: &types.RemoveTaskRequest{
-				ShardID: 0,
-				Type:    common.Int32Ptr(int32(common.TaskTypeCrossCluster)),
-				TaskID:  int64(1),
-			},
-			expectedError: false,
-			mockFn: func() {
-				s.mockResource.ExecutionMgr.On("CompleteCrossClusterTask", mock.Anything, &persistence.CompleteCrossClusterTaskRequest{
-					TaskID: int64(1),
-				}).Return(nil).Once()
-			},
-		},
 		"invalid": {
 			request: &types.RemoveTaskRequest{
 				ShardID: 0,
@@ -1329,17 +1316,6 @@ func (s *handlerSuite) TestResetQueue() {
 				s.mockEngine.EXPECT().ResetTimerQueue(gomock.Any(), gomock.Any()).Return(nil).Times(1)
 			},
 		},
-		"cros cluster task": {
-			request: &types.ResetQueueRequest{
-				ShardID: 0,
-				Type:    common.Int32Ptr(int32(common.TaskTypeCrossCluster)),
-			},
-			expectedError: false,
-			mockFn: func() {
-				s.mockShardController.EXPECT().GetEngineForShard(0).Return(s.mockEngine, nil).Times(1)
-				s.mockEngine.EXPECT().ResetCrossClusterQueue(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			},
-		},
 		"invalid task": {
 			request: &types.ResetQueueRequest{
 				ShardID: 0,
@@ -1401,17 +1377,6 @@ func (s *handlerSuite) TestDescribeQueue() {
 			mockFn: func() {
 				s.mockShardController.EXPECT().GetEngineForShard(0).Return(s.mockEngine, nil).Times(1)
 				s.mockEngine.EXPECT().DescribeTimerQueue(gomock.Any(), gomock.Any()).Return(&types.DescribeQueueResponse{}, nil).Times(1)
-			},
-		},
-		"cross cluster task": {
-			request: &types.DescribeQueueRequest{
-				ShardID: 0,
-				Type:    common.Int32Ptr(int32(common.TaskTypeCrossCluster)),
-			},
-			expectedError: false,
-			mockFn: func() {
-				s.mockShardController.EXPECT().GetEngineForShard(0).Return(s.mockEngine, nil).Times(1)
-				s.mockEngine.EXPECT().DescribeCrossClusterQueue(gomock.Any(), gomock.Any()).Return(&types.DescribeQueueResponse{}, nil).Times(1)
 			},
 		},
 		"invalid task": {
@@ -3375,109 +3340,6 @@ func (s *handlerSuite) TestRefreshWorkflowTasks() {
 	}
 }
 
-func (s *handlerSuite) TestGetCrossClusterTasks() {
-	numShards := 10
-	targetCluster := cluster.TestAlternativeClusterName
-	var shardIDs []int32
-	numSucceeded := int32(0)
-	numTasksPerShard := rand.Intn(10)
-
-	s.mockShardController.EXPECT().GetEngineForShard(gomock.Any()).Return(s.mockEngine, nil).Times(numShards)
-	s.mockEngine.EXPECT().GetCrossClusterTasks(gomock.Any(), targetCluster).DoAndReturn(
-		func(_ context.Context, _ string) ([]*types.CrossClusterTaskRequest, error) {
-			succeeded := rand.Intn(2) == 0
-			if succeeded {
-				atomic.AddInt32(&numSucceeded, 1)
-				return make([]*types.CrossClusterTaskRequest, numTasksPerShard), nil
-			}
-			return nil, errors.New("some random error")
-		},
-	).MaxTimes(numShards)
-
-	for i := 0; i != numShards; i++ {
-		shardIDs = append(shardIDs, int32(i))
-	}
-	request := &types.GetCrossClusterTasksRequest{
-		ShardIDs:      shardIDs,
-		TargetCluster: targetCluster,
-	}
-
-	response, err := s.handler.GetCrossClusterTasks(context.Background(), request)
-	s.NoError(err)
-	s.NotNil(response)
-
-	s.Len(response.TasksByShard, int(numSucceeded))
-	s.Len(response.FailedCauseByShard, numShards-int(numSucceeded))
-	for _, tasksRequests := range response.GetTasksByShard() {
-		s.Len(tasksRequests, numTasksPerShard)
-	}
-}
-
-func (s *handlerSuite) TestGetCrossClusterTasksFails_IfGetEngineFails() {
-	numShards := 10
-	targetCluster := cluster.TestAlternativeClusterName
-	var shardIDs []int32
-
-	for i := 0; i != numShards; i++ {
-		shardIDs = append(shardIDs, int32(i))
-		s.mockShardController.EXPECT().GetEngineForShard(i).
-			Return(nil, errors.New("failed to get engine"))
-
-		// as response to the above failure we're looking up for the current shard owner
-		s.mockResource.MembershipResolver.EXPECT().Lookup(service.History, string(rune(i)))
-	}
-
-	request := &types.GetCrossClusterTasksRequest{
-		ShardIDs:      shardIDs,
-		TargetCluster: targetCluster,
-	}
-
-	response, err := s.handler.GetCrossClusterTasks(context.Background(), request)
-	s.NoError(err)
-	s.NotNil(response)
-
-	s.Len(response.FailedCauseByShard, numShards, "we fail GetEngineForShard every time")
-	for _, failure := range response.FailedCauseByShard {
-		s.IsType(types.GetTaskFailedCauseShardOwnershipLost, failure)
-	}
-}
-
-func (s *handlerSuite) TestRespondCrossClusterTaskCompleted_FetchNewTask() {
-	s.testRespondCrossClusterTaskCompleted(true)
-}
-
-func (s *handlerSuite) TestRespondCrossClusterTaskCompleted_NoNewTask() {
-	s.testRespondCrossClusterTaskCompleted(false)
-}
-
-func (s *handlerSuite) testRespondCrossClusterTaskCompleted(
-	fetchNewTask bool,
-) {
-	numTasks := 10
-	targetCluster := cluster.TestAlternativeClusterName
-	request := &types.RespondCrossClusterTasksCompletedRequest{
-		ShardID:       0,
-		TargetCluster: targetCluster,
-		TaskResponses: make([]*types.CrossClusterTaskResponse, numTasks),
-		FetchNewTasks: fetchNewTask,
-	}
-	s.mockShardController.EXPECT().GetEngineForShard(0).Return(s.mockEngine, nil)
-	s.mockEngine.EXPECT().RespondCrossClusterTasksCompleted(gomock.Any(), targetCluster, request.TaskResponses).Return(nil).Times(1)
-	if fetchNewTask {
-		s.mockEngine.EXPECT().GetCrossClusterTasks(gomock.Any(), targetCluster).Return(make([]*types.CrossClusterTaskRequest, numTasks), nil).Times(1)
-	}
-
-	response, err := s.handler.RespondCrossClusterTasksCompleted(context.Background(), request)
-	s.NoError(err)
-	s.NotNil(response)
-
-	if !fetchNewTask {
-		s.Empty(response.Tasks)
-	} else {
-		s.Len(response.Tasks, numTasks)
-	}
-}
-
 func (s *handlerSuite) TestStartWorkflowExecution() {
 
 	request := &types.HistoryStartWorkflowExecutionRequest{
@@ -3684,18 +3546,6 @@ func (s *handlerSuite) TestCorrectUseOfErrorHandling() {
 	}
 }
 
-func (s *handlerSuite) TestRatelimitUpdate() {
-	response, err := s.handler.RatelimitUpdate(context.Background(), &types.RatelimitUpdateRequest{
-		Any: &types.Any{
-			ValueType: "test",
-			Value:     []byte(`test data`),
-		},
-	})
-	// placeholder while not implemented
-	s.Nil(response)
-	s.Nil(err)
-}
-
 func (s *handlerSuite) TestConvertError() {
 	testCases := []struct {
 		name     string
@@ -3755,4 +3605,41 @@ func (s *handlerSuite) TestConvertError() {
 		err := s.handler.convertError(tc.input)
 		s.Equal(tc.expected, err, tc.name)
 	}
+}
+
+func TestRatelimitUpdate(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	res := resource.NewMockResource(ctrl)
+	res.EXPECT().GetMetricsClient().Return(metrics.NewNoopMetricsClient()).AnyTimes()
+	res.EXPECT().GetLogger().Return(testlogger.New(t)).AnyTimes()
+	update, err := rpc.TestUpdateToAny(t, "testhost", time.Second, map[shared.GlobalKey]rpc.Calls{
+		"test:domain-user-limit": {
+			Allowed:  10,
+			Rejected: 5,
+		},
+	})
+	require.NoError(t, err)
+	alg, err := algorithm.New(algorithm.Config{
+		NewDataWeight:  func(opts ...dynamicconfig.FilterOption) float64 { return 0.5 },
+		UpdateInterval: func(opts ...dynamicconfig.FilterOption) time.Duration { return 3 * time.Second },
+		DecayAfter:     func(opts ...dynamicconfig.FilterOption) time.Duration { return 6 * time.Second },
+		GcAfter:        func(opts ...dynamicconfig.FilterOption) time.Duration { return time.Minute },
+	})
+	require.NoError(t, err)
+	h := &handlerImpl{
+		Resource:            res,
+		ratelimitAggregator: alg,
+	}
+
+	resp, err := h.RatelimitUpdate(context.Background(), &types.RatelimitUpdateRequest{
+		Any: update,
+	})
+	require.NoError(t, err)
+	w, err := rpc.TestAnyToWeights(t, resp.Any)
+	require.NoError(t, err)
+	assert.Equalf(t,
+		map[shared.GlobalKey]float64{"test:domain-user-limit": 1},
+		w,
+		"unexpected weights returned from aggregator or serialization.  if values differ in a reasonable way, possibly aggregator behavior changed?",
+	)
 }

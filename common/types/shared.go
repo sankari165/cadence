@@ -1974,7 +1974,9 @@ func (v *DomainInfo) GetUUID() (o string) {
 	return
 }
 
-// DomainNotActiveError is an internal type (TBD...)
+// DomainNotActiveError is an internal type.
+// this is a retriable error and *must* be retried under at least
+// some circumstances due to domain failover races.
 type DomainNotActiveError struct {
 	Message        string `json:"message,required"`
 	DomainName     string `json:"domainName,required"`
@@ -3482,14 +3484,15 @@ func (v *ListOpenWorkflowExecutionsResponse) GetExecutions() (o []*WorkflowExecu
 
 // ListAllWorkflowExecutionsRequest is the request to ListAllWorkflowExecutions
 type ListAllWorkflowExecutionsRequest struct {
-	Domain              string           `json:"domain,omitempty"`
-	MaximumPageSize     int32            `json:"maximumPageSize,omitempty"`
-	NextPageToken       []byte           `json:"nextPageToken,omitempty"`
-	StartTimeFilter     *StartTimeFilter `json:"StartTimeFilter,omitempty"`
-	PartialMatch        bool             `json:"partialMatch,omitempty"`
-	WorkflowSearchValue string           `json:"workflowSearchValue,omitempty"`
-	SortColumn          string           `json:"sortColumn,omitempty"`
-	SortOrder           string           `json:"sortOrder,omitempty"`
+	Domain              string                         `json:"domain,omitempty"`
+	MaximumPageSize     int32                          `json:"maximumPageSize,omitempty"`
+	NextPageToken       []byte                         `json:"nextPageToken,omitempty"`
+	StartTimeFilter     *StartTimeFilter               `json:"StartTimeFilter,omitempty"`
+	PartialMatch        bool                           `json:"partialMatch,omitempty"`
+	StatusFilter        []WorkflowExecutionCloseStatus `json:"closeStatus,omitempty"`
+	WorkflowSearchValue string                         `json:"workflowSearchValue,omitempty"`
+	SortColumn          string                         `json:"sortColumn,omitempty"`
+	SortOrder           string                         `json:"sortOrder,omitempty"`
 }
 
 func (v *ListAllWorkflowExecutionsRequest) SerializeForLogging() (string, error) {

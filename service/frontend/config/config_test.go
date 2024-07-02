@@ -104,6 +104,8 @@ func TestNewConfig(t *testing.T) {
 		"EmitSignalNameMetricsTag":                    {dynamicconfig.FrontendEmitSignalNameMetricsTag, true},
 		"Lockdown":                                    {dynamicconfig.Lockdown, false},
 		"EnableTasklistIsolation":                     {dynamicconfig.EnableTasklistIsolation, true},
+		"GlobalRatelimiterKeyMode":                    {dynamicconfig.FrontendGlobalRatelimiterMode, "disabled"},
+		"GlobalRatelimiterUpdateInterval":             {dynamicconfig.GlobalRatelimiterUpdateInterval, 3 * time.Second},
 	}
 	domainFields := map[string]configTestCase{
 		"MaxBadBinaryCount":      {dynamicconfig.FrontendMaxBadBinaries, 40},
@@ -111,6 +113,7 @@ func TestNewConfig(t *testing.T) {
 		"MaxRetentionDays":       {dynamicconfig.MaxRetentionDays, 42},
 		"FailoverCoolDown":       {dynamicconfig.FrontendFailoverCoolDown, time.Duration(43)},
 		"RequiredDomainDataKeys": {dynamicconfig.RequiredDomainDataKeys, map[string]interface{}{"bar": "baz"}},
+		"FailoverHistoryMaxSize": {dynamicconfig.FrontendFailoverHistoryMaxSize, 44},
 	}
 	client := dynamicconfig.NewInMemoryClient()
 	dc := dynamicconfig.NewCollection(client, testlogger.New(t))
@@ -170,6 +173,8 @@ func getValue(f *reflect.Value) interface{} {
 			return fn()
 		case dynamicconfig.StringPropertyFn:
 			return fn()
+		case dynamicconfig.StringPropertyWithRatelimitKeyFilter:
+			return fn("user:domain")
 		default:
 			panic("Unable to handle type: " + f.Type().Name())
 		}

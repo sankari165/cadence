@@ -30,18 +30,20 @@ import (
 
 	"github.com/pborman/uuid"
 	"go.uber.org/yarpc/yarpcerrors"
+	"golang.org/x/exp/maps"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/definition"
 	"github.com/uber/cadence/common/dynamicconfig"
-	"github.com/uber/cadence/common/future"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
 	"github.com/uber/cadence/common/membership"
 	"github.com/uber/cadence/common/metrics"
 	"github.com/uber/cadence/common/persistence"
 	"github.com/uber/cadence/common/quotas"
+	"github.com/uber/cadence/common/quotas/global/algorithm"
+	"github.com/uber/cadence/common/quotas/global/rpc"
 	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/common/types/mapper/proto"
 	"github.com/uber/cadence/service/history/config"
@@ -75,13 +77,13 @@ type (
 		config                         *config.Config
 		historyEventNotifier           events.Notifier
 		rateLimiter                    quotas.Limiter
-		crossClusterTaskFetchers       task.Fetchers
 		replicationTaskFetchers        replication.TaskFetchers
 		queueTaskProcessor             task.Processor
 		failoverCoordinator            failover.Coordinator
 		workflowIDCache                workflowcache.WFCache
 		ratelimitInternalPerWorkflowID dynamicconfig.BoolPropertyFnWithDomainFilter
 		queueProcessorFactory          queue.ProcessorFactory
+		ratelimitAggregator            algorithm.RequestWeighted
 	}
 )
 
@@ -102,6 +104,7 @@ func NewHandler(
 		rateLimiter:                    quotas.NewDynamicRateLimiter(config.RPS.AsFloat64()),
 		workflowIDCache:                wfCache,
 		ratelimitInternalPerWorkflowID: ratelimitInternalPerWorkflowID,
+		ratelimitAggregator:            resource.GetRatelimiterAlgorithm(),
 	}
 
 	// prevent us from trying to serve requests before shard controller is started and ready
@@ -111,21 +114,6 @@ func NewHandler(
 
 // Start starts the handler
 func (h *handlerImpl) Start() {
-	h.crossClusterTaskFetchers = task.NewCrossClusterTaskFetchers(
-		h.GetClusterMetadata(),
-		h.GetClientBean(),
-		&task.FetcherOptions{
-			Parallelism:                h.config.CrossClusterFetcherParallelism,
-			AggregationInterval:        h.config.CrossClusterFetcherAggregationInterval,
-			ServiceBusyBackoffInterval: h.config.CrossClusterFetcherServiceBusyBackoffInterval,
-			ErrorRetryInterval:         h.config.CrossClusterFetcherErrorBackoffInterval,
-			TimerJitterCoefficient:     h.config.CrossClusterFetcherJitterCoefficient,
-		},
-		h.GetMetricsClient(),
-		h.GetLogger(),
-	)
-	h.crossClusterTaskFetchers.Start()
-
 	h.replicationTaskFetchers = replication.NewTaskFetchers(
 		h.GetLogger(),
 		h.config,
@@ -185,7 +173,6 @@ func (h *handlerImpl) Start() {
 // Stop stops the handler
 func (h *handlerImpl) Stop() {
 	h.prepareToShutDown()
-	h.crossClusterTaskFetchers.Stop()
 	h.replicationTaskFetchers.Stop()
 	h.controller.Stop()
 	h.queueTaskProcessor.Stop()
@@ -223,7 +210,6 @@ func (h *handlerImpl) CreateEngine(
 		h.GetSDKClient(),
 		h.historyEventNotifier,
 		h.config,
-		h.crossClusterTaskFetchers,
 		h.replicationTaskFetchers,
 		h.GetMatchingRawClient(),
 		h.queueTaskProcessor,
@@ -756,11 +742,6 @@ func (h *handlerImpl) RemoveTask(
 		return executionMgr.CompleteReplicationTask(ctx, &persistence.CompleteReplicationTaskRequest{
 			TaskID: request.GetTaskID(),
 		})
-	case common.TaskTypeCrossCluster:
-		return executionMgr.CompleteCrossClusterTask(ctx, &persistence.CompleteCrossClusterTaskRequest{
-			TargetCluster: request.GetClusterName(),
-			TaskID:        request.GetTaskID(),
-		})
 	default:
 		return constants.ErrInvalidTaskType
 	}
@@ -797,8 +778,6 @@ func (h *handlerImpl) ResetQueue(
 		err = engine.ResetTransferQueue(ctx, request.GetClusterName())
 	case common.TaskTypeTimer:
 		err = engine.ResetTimerQueue(ctx, request.GetClusterName())
-	case common.TaskTypeCrossCluster:
-		err = engine.ResetCrossClusterQueue(ctx, request.GetClusterName())
 	default:
 		err = constants.ErrInvalidTaskType
 	}
@@ -831,8 +810,6 @@ func (h *handlerImpl) DescribeQueue(
 		resp, err = engine.DescribeTransferQueue(ctx, request.GetClusterName())
 	case common.TaskTypeTimer:
 		resp, err = engine.DescribeTimerQueue(ctx, request.GetClusterName())
-	case common.TaskTypeCrossCluster:
-		resp, err = engine.DescribeCrossClusterQueue(ctx, request.GetClusterName())
 	default:
 		err = constants.ErrInvalidTaskType
 	}
@@ -1941,99 +1918,14 @@ func (h *handlerImpl) GetCrossClusterTasks(
 	ctx context.Context,
 	request *types.GetCrossClusterTasksRequest,
 ) (resp *types.GetCrossClusterTasksResponse, retError error) {
-	defer func() { log.CapturePanic(recover(), h.GetLogger(), &retError) }()
-	h.startWG.Wait()
-
-	_, sw := h.startRequestProfile(ctx, metrics.HistoryGetCrossClusterTasksScope)
-	defer sw.Stop()
-
-	if h.isShuttingDown() {
-		return nil, constants.ErrShuttingDown
-	}
-
-	ctx, cancel := common.CreateChildContext(ctx, 0.05)
-	defer cancel()
-
-	futureByShardID := make(map[int32]future.Future, len(request.ShardIDs))
-	for _, shardID := range request.ShardIDs {
-		future, settable := future.NewFuture()
-		futureByShardID[shardID] = future
-		go func(shardID int) {
-			logger := h.GetLogger().WithTags(tag.ShardID(shardID))
-			engine, err := h.controller.GetEngineForShard(shardID)
-			if err != nil {
-				logger.Error("History engine not found for shard", tag.Error(err))
-				var owner membership.HostInfo
-				if info, err := lookup.HistoryServerByShardID(h.GetMembershipResolver(), shardID); err == nil {
-					owner = info
-				}
-				settable.Set(nil, shard.CreateShardOwnershipLostError(h.GetHostInfo(), owner))
-				return
-			}
-
-			if tasks, err := engine.GetCrossClusterTasks(ctx, request.TargetCluster); err != nil {
-				logger.Error("Failed to get cross cluster tasks", tag.Error(err))
-				settable.Set(nil, h.convertError(err))
-			} else {
-				settable.Set(tasks, nil)
-			}
-		}(int(shardID))
-	}
-
-	response := &types.GetCrossClusterTasksResponse{
-		TasksByShard:       make(map[int32][]*types.CrossClusterTaskRequest),
-		FailedCauseByShard: make(map[int32]types.GetTaskFailedCause),
-	}
-	for shardID, future := range futureByShardID {
-		var taskRequests []*types.CrossClusterTaskRequest
-		if futureErr := future.Get(ctx, &taskRequests); futureErr != nil {
-			response.FailedCauseByShard[shardID] = common.ConvertErrToGetTaskFailedCause(futureErr)
-		} else {
-			response.TasksByShard[shardID] = taskRequests
-		}
-	}
-	// not using a waitGroup for created goroutines here
-	// as once all futures are unblocked,
-	// those goroutines will eventually be completed
-
-	return response, nil
+	return nil, types.BadRequestError{Message: "The cross-cluster feature has been deprecated."}
 }
 
 func (h *handlerImpl) RespondCrossClusterTasksCompleted(
 	ctx context.Context,
 	request *types.RespondCrossClusterTasksCompletedRequest,
 ) (resp *types.RespondCrossClusterTasksCompletedResponse, retError error) {
-	defer func() { log.CapturePanic(recover(), h.GetLogger(), &retError) }()
-	h.startWG.Wait()
-
-	scope, sw := h.startRequestProfile(ctx, metrics.HistoryRespondCrossClusterTasksCompletedScope)
-	defer sw.Stop()
-
-	if h.isShuttingDown() {
-		return nil, constants.ErrShuttingDown
-	}
-
-	engine, err := h.controller.GetEngineForShard(int(request.GetShardID()))
-	if err != nil {
-		return nil, h.error(err, scope, "", "", "")
-	}
-
-	err = engine.RespondCrossClusterTasksCompleted(ctx, request.TargetCluster, request.TaskResponses)
-	if err != nil {
-		return nil, h.error(err, scope, "", "", "")
-	}
-
-	response := &types.RespondCrossClusterTasksCompletedResponse{}
-	if request.FetchNewTasks {
-		fetchTaskCtx, cancel := common.CreateChildContext(ctx, 0.05)
-		defer cancel()
-
-		response.Tasks, err = engine.GetCrossClusterTasks(fetchTaskCtx, request.TargetCluster)
-		if err != nil {
-			return nil, h.error(err, scope, "", "", "")
-		}
-	}
-	return response, nil
+	return nil, types.BadRequestError{Message: "The cross-cluster feature has been deprecated"}
 }
 
 func (h *handlerImpl) GetFailoverInfo(
@@ -2060,9 +1952,46 @@ func (h *handlerImpl) GetFailoverInfo(
 func (h *handlerImpl) RatelimitUpdate(
 	ctx context.Context,
 	request *types.RatelimitUpdateRequest,
-) (*types.RatelimitUpdateResponse, error) {
-	// TODO: wire up to real global-ratelimit aggregator
-	return nil, nil
+) (_ *types.RatelimitUpdateResponse, retError error) {
+	defer func() { log.CapturePanic(recover(), h.GetLogger(), &retError) }()
+	h.startWG.Wait()
+
+	scope, sw := h.startRequestProfile(ctx, metrics.HistoryRatelimitUpdateScope)
+	defer sw.Stop()
+
+	if h.isShuttingDown() {
+		return nil, constants.ErrShuttingDown
+	}
+
+	// for now there is just one ratelimit-rpc type and one algorithm that makes use of it.
+	// unpack the arg and pass it to the aggregator.
+	// in the future, this should select the algorithm by the Any.ValueType, via a registry of some kind.
+	arg, err := rpc.AnyToAggregatorUpdate(request.Any)
+	if err != nil {
+		return nil, h.error(fmt.Errorf("failed to map data to args: %w", err), scope, "", "", "")
+	}
+	err = h.ratelimitAggregator.Update(arg)
+	if err != nil {
+		return nil, h.error(fmt.Errorf("failed to update ratelimits: %w", err), scope, "", "", "")
+	}
+
+	// collect the response data and pack it into an Any for the response.
+	// like unpacking, this will eventually be handled by the registry above.
+	//
+	// "_" is ignoring "used RPS" data here.  it is likely useful for being friendlier
+	// to brief, bursty-but-within-limits load, but that has not yet been built.
+	weights, _, err := h.ratelimitAggregator.HostWeights(arg.ID, maps.Keys(arg.Load))
+	if err != nil {
+		return nil, h.error(fmt.Errorf("failed to retrieve updated weights: %w", err), scope, "", "", "")
+	}
+	resAny, err := rpc.AggregatorWeightsToAny(weights)
+	if err != nil {
+		return nil, h.error(fmt.Errorf("failed to Any-package response: %w", err), scope, "", "", "")
+	}
+
+	return &types.RatelimitUpdateResponse{
+		Any: resAny,
+	}, nil
 }
 
 // convertError is a helper method to convert ShardOwnershipLostError from persistence layer returned by various

@@ -135,6 +135,9 @@ var (
 	ComponentPinotVisibilityManager     = component("pinot-visibility-manager")
 	ComponentAsyncWFConsumptionManager  = component("async-wf-consumption-manager")
 	ComponentGlobalRatelimiter          = component("global-ratelimiter")
+	ComponentMapQ                       = component("mapq")
+	ComponentMapQTree                   = component("mapq-tree")
+	ComponentMapQTreeNode               = component("mapq-tree-node")
 )
 
 // Pre-defined values for TagSysLifecycle
@@ -412,6 +415,7 @@ var (
 	HistoryClientOperationRespondActivityTaskFailed         = clientOperation("history-respond-activity-task-failed")
 	HistoryClientOperationRespondDecisionTaskCompleted      = clientOperation("history-respond-decision-task-completed")
 	HistoryClientOperationRespondDecisionTaskFailed         = clientOperation("history-respond-decision-task-failed")
+	HistoryClientOperationRatelimitUpdate                   = clientOperation("history-ratelimit-update")
 
 	MatchingClientOperationAddActivityTask           = clientOperation("matching-add-activity-task")
 	MatchingClientOperationAddDecisionTask           = clientOperation("matching-add-decision-task")

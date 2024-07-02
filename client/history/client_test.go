@@ -263,59 +263,6 @@ func TestClient_withResponse(t *testing.T) {
 			want: &types.MergeDLQMessagesResponse{},
 		},
 		{
-			name: "GetCrossClusterTasks",
-			op: func(c Client) (any, error) {
-				return c.GetCrossClusterTasks(context.Background(), &types.GetCrossClusterTasksRequest{
-					ShardIDs: []int32{100, 101, 102},
-				})
-			},
-			mock: func(p *MockPeerResolver, c *MockClient) {
-				p.EXPECT().FromShardID(100).Return("test-peer-0", nil).Times(1)
-				p.EXPECT().FromShardID(101).Return("test-peer-1", nil).Times(1)
-				p.EXPECT().FromShardID(102).Return("test-peer-2", nil).Times(1)
-				c.EXPECT().GetCrossClusterTasks(gomock.Any(), gomock.Any(), []yarpc.CallOption{yarpc.WithShardKey("test-peer-0")}).
-					Return(&types.GetCrossClusterTasksResponse{
-						TasksByShard: map[int32][]*types.CrossClusterTaskRequest{
-							100: {{}, {}},
-						},
-					}, nil).Times(1)
-				c.EXPECT().GetCrossClusterTasks(gomock.Any(), gomock.Any(), []yarpc.CallOption{yarpc.WithShardKey("test-peer-1")}).
-					Return(&types.GetCrossClusterTasksResponse{
-						TasksByShard: map[int32][]*types.CrossClusterTaskRequest{
-							101: {{}},
-						},
-					}, nil).Times(1)
-				c.EXPECT().GetCrossClusterTasks(gomock.Any(), gomock.Any(), []yarpc.CallOption{yarpc.WithShardKey("test-peer-2")}).
-					Return(&types.GetCrossClusterTasksResponse{
-						TasksByShard: map[int32][]*types.CrossClusterTaskRequest{
-							102: {{}, {}, {}},
-						},
-					}, nil).Times(1)
-			},
-			want: &types.GetCrossClusterTasksResponse{
-				TasksByShard: map[int32][]*types.CrossClusterTaskRequest{
-					100: {{}, {}},
-					101: {{}},
-					102: {{}, {}, {}},
-				},
-				FailedCauseByShard: map[int32]types.GetTaskFailedCause{},
-			},
-		},
-		{
-			name: "RespondCrossClusterTasksCompleted",
-			op: func(c Client) (any, error) {
-				return c.RespondCrossClusterTasksCompleted(context.Background(), &types.RespondCrossClusterTasksCompletedRequest{
-					ShardID: 123,
-				})
-			},
-			mock: func(p *MockPeerResolver, c *MockClient) {
-				p.EXPECT().FromShardID(123).Return("test-peer", nil).Times(1)
-				c.EXPECT().RespondCrossClusterTasksCompleted(gomock.Any(), gomock.Any(), []yarpc.CallOption{yarpc.WithShardKey("test-peer")}).
-					Return(&types.RespondCrossClusterTasksCompletedResponse{}, nil).Times(1)
-			},
-			want: &types.RespondCrossClusterTasksCompletedResponse{},
-		},
-		{
 			name: "GetFailoverInfo",
 			op: func(c Client) (any, error) {
 				return c.GetFailoverInfo(context.Background(), &types.GetFailoverInfoRequest{
@@ -506,6 +453,22 @@ func TestClient_withResponse(t *testing.T) {
 					Return(&types.StartWorkflowExecutionResponse{}, nil).Times(1)
 			},
 			want: &types.StartWorkflowExecutionResponse{},
+		},
+		{
+			name: "RatelimitUpdate",
+			op: func(c Client) (any, error) {
+				return c.RatelimitUpdate(context.Background(), &types.RatelimitUpdateRequest{
+					Any: &types.Any{
+						ValueType: "something",
+						Value:     []byte("data"),
+					},
+				}, yarpc.WithShardKey("test-peer"))
+			},
+			mock: func(p *MockPeerResolver, c *MockClient) {
+				c.EXPECT().RatelimitUpdate(gomock.Any(), gomock.Any(), []yarpc.CallOption{yarpc.WithShardKey("test-peer")}).
+					Return(&types.RatelimitUpdateResponse{}, nil).Times(1)
+			},
+			want: &types.RatelimitUpdateResponse{},
 		},
 		{
 			name: "StartWorkflowExecution peer resolve failure",
@@ -819,42 +782,6 @@ func TestClient_withResponse(t *testing.T) {
 			wantError: true,
 		},
 		{
-			name: "GetCrossClusterTasks fail open",
-			op: func(c Client) (any, error) {
-				return c.GetCrossClusterTasks(context.Background(), &types.GetCrossClusterTasksRequest{
-					ShardIDs: []int32{100},
-				})
-			},
-			mock: func(p *MockPeerResolver, c *MockClient) {
-				// Add your mock expectations here
-				p.EXPECT().FromShardID(100).Return("test-peer", nil).Times(1)
-				c.EXPECT().GetCrossClusterTasks(gomock.Any(), gomock.Any(), []yarpc.CallOption{yarpc.WithShardKey("test-peer")}).
-					Return(nil, fmt.Errorf("GetCrossClusterTasks failed")).Times(1)
-			},
-			want: &types.GetCrossClusterTasksResponse{
-				TasksByShard: make(map[int32][]*types.CrossClusterTaskRequest),
-				FailedCauseByShard: map[int32]types.GetTaskFailedCause{
-					100: types.GetTaskFailedCauseUncategorized,
-				},
-			},
-			wantError: false,
-		},
-		{
-			name: "RespondCrossClusterTasksCompleted fail",
-			op: func(c Client) (any, error) {
-				return c.RespondCrossClusterTasksCompleted(context.Background(), &types.RespondCrossClusterTasksCompletedRequest{
-					ShardID: 123,
-				})
-			},
-			mock: func(p *MockPeerResolver, c *MockClient) {
-				// Add your mock expectations here
-				p.EXPECT().FromShardID(123).Return("test-peer", nil).Times(1)
-				c.EXPECT().RespondCrossClusterTasksCompleted(gomock.Any(), gomock.Any(), []yarpc.CallOption{yarpc.WithShardKey("test-peer")}).
-					Return(nil, fmt.Errorf("RespondCrossClusterTasksCompleted failed")).Times(1)
-			},
-			wantError: true,
-		},
-		{
 			name: "GetFailoverInfo fail",
 			op: func(c Client) (any, error) {
 				return c.GetFailoverInfo(context.Background(), &types.GetFailoverInfoRequest{
@@ -992,6 +919,23 @@ func TestClient_withResponse(t *testing.T) {
 				p.EXPECT().FromWorkflowID("test-workflow").Return("test-peer", nil).Times(1)
 				c.EXPECT().SignalWithStartWorkflowExecution(gomock.Any(), gomock.Any(), []yarpc.CallOption{yarpc.WithShardKey("test-peer")}).
 					Return(nil, fmt.Errorf("SignalWithStartWorkflowExecution failed")).Times(1)
+			},
+			wantError: true,
+		},
+		{
+			name: "RatelimitUpdate requires explicit shard key arg",
+			op: func(c Client) (any, error) {
+				// same as successful call...
+				return c.RatelimitUpdate(context.Background(), &types.RatelimitUpdateRequest{
+					// Peer: "", // intentionally the zero value
+					Any: &types.Any{
+						ValueType: "something",
+						Value:     []byte("data"),
+					},
+				})
+			},
+			mock: func(p *MockPeerResolver, c *MockClient) {
+				// no calls expected
 			},
 			wantError: true,
 		},

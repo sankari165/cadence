@@ -62,9 +62,6 @@ const (
 	IsDeleted            = "IsDeleted"   // used for Pinot deletion/rolling upsert only, not visible to user
 	EventTimeMs          = "EventTimeMs" // used for Pinot deletion/rolling upsert only, not visible to user
 	Memo                 = "Memo"
-	WfIDTextSearch       = "WorkflowIDTextSearch"   // used for text search which can improve the partial match performance on WorkflowID/RunID/WorkflowType text search columns
-	WfTypeTextSearch     = "WorkflowTypeTextSearch" // used for text search which can improve the partial match performance on WorkflowID/RunID/WorkflowType text search columns
-	RunIDTextSearch      = "RunIDTextSearch"        // used for text search which can improve the partial match performance on WorkflowID/RunID/WorkflowType text search columns
 
 	// used to be micro second
 	oneMicroSecondInNano = int64(time.Microsecond / time.Nanosecond)
@@ -618,10 +615,7 @@ func createVisibilityMessage(
 	m[UpdateTime] = updateTimeUnixMilli
 	m[ShardID] = shardID
 	m[IsDeleted] = isDeleted
-	m[EventTimeMs] = updateTimeUnixMilli   // same as update time when record is upserted, could not use updateTime directly since this will be modified by Pinot
-	m[WfIDTextSearch] = wid                // used for text search which can improve the partial match performance
-	m[RunIDTextSearch] = rid               // used for text search which can improve the partial match performance
-	m[WfTypeTextSearch] = workflowTypeName // used for text search which can improve the partial match performance
+	m[EventTimeMs] = updateTimeUnixMilli // same as update time when record is upserted, could not use updateTime directly since this will be modified by Pinot
 
 	SearchAttributes := make(map[string]interface{})
 	var err error
@@ -720,20 +714,19 @@ func (s *PinotQuerySearchField) resetSearchField() {
 
 func (s *PinotQuerySearchField) addEqual(obj string, val interface{}) {
 	s.checkFirstSearchField()
-	if _, ok := val.(string); ok {
-		val = fmt.Sprintf("'%s'", val)
-	} else {
-		val = fmt.Sprintf("%v", val)
+	switch val.(type) {
+	case string:
+		s.string += fmt.Sprintf("%s = '%s'\n", obj, val)
+	case int32:
+		s.string += fmt.Sprintf("%s = %d\n", obj, val)
+	default:
+		s.string += fmt.Sprintf("%s = %v\n", obj, val)
 	}
-
-	quotedVal := fmt.Sprintf("%s", val)
-	s.string += fmt.Sprintf("%s = %s\n", obj, quotedVal)
 }
 
 func (s *PinotQuerySearchField) addMatch(obj string, val interface{}) {
 	s.checkFirstSearchField()
-
-	s.string += fmt.Sprintf("text_match(%s, '\"%s\"')\n", obj, val)
+	s.string += fmt.Sprintf("REGEXP_LIKE(%s, '^.*%s.*$')\n", obj, val)
 }
 
 func NewPinotQuery(tableName string) PinotQuery {
@@ -778,7 +771,7 @@ func (q *PinotQuery) addOffsetAndLimits(offset int, limit int) {
 
 func (q *PinotQuery) addStatusFilters(status []types.WorkflowExecutionCloseStatus) {
 	for _, s := range status {
-		q.search.addEqual(CloseStatus, s.String())
+		q.search.addEqual(CloseStatus, int32(s))
 	}
 
 	q.search.lastSearchField()

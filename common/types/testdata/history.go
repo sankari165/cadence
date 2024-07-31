@@ -492,6 +492,9 @@ var (
 		Header:                              &Header,
 		Memo:                                &Memo,
 		SearchAttributes:                    &SearchAttributes,
+		DelayStartSeconds:                   &Duration3,
+		JitterStartSeconds:                  &Duration4,
+		FirstRunAtTimestamp:                 &Timestamp1,
 	}
 	StartChildWorkflowExecutionFailedEventAttributes = types.StartChildWorkflowExecutionFailedEventAttributes{
 		Domain:                       DomainName,

@@ -40,8 +40,16 @@ import (
 	es "github.com/uber/cadence/common/elasticsearch"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/tag"
+	"github.com/uber/cadence/common/pinot"
 	"github.com/uber/cadence/common/resource"
 	"github.com/uber/cadence/service/worker/workercommon"
+)
+
+type readMode string
+
+const (
+	Pinot readMode = "pinot"
+	ES    readMode = "es"
 )
 
 type (
@@ -51,9 +59,12 @@ type (
 		frontendClient      frontend.Client
 		clientBean          client.Bean
 		esClient            es.GenericClient
+		pinotClient         pinot.GenericClient
+		readMode            readMode
 		logger              log.Logger
 		tallyScope          tally.Scope
 		visibilityIndexName string
+		pinotTableName      string
 		resource            resource.Resource
 		domainCache         cache.DomainCache
 		config              *Config
@@ -98,21 +109,33 @@ func New(
 	frontendClient frontend.Client,
 	clientBean client.Bean,
 	esClient es.GenericClient,
+	pinotClient pinot.GenericClient,
 	esConfig *config.ElasticSearchConfig,
+	pinotConfig *config.PinotVisibilityConfig,
 	logger log.Logger,
 	tallyScope tally.Scope,
 	resource resource.Resource,
 	domainCache cache.DomainCache,
 	config *Config,
 ) *Analyzer {
+	var mode readMode
+	if esClient != nil {
+		mode = ES
+	} else if pinotClient != nil {
+		mode = Pinot
+	}
+
 	return &Analyzer{
 		svcClient:           svcClient,
 		frontendClient:      frontendClient,
 		clientBean:          clientBean,
 		esClient:            esClient,
+		pinotClient:         pinotClient,
+		readMode:            mode,
 		logger:              logger,
 		tallyScope:          tallyScope,
 		visibilityIndexName: esConfig.Indices[common.VisibilityAppName],
+		pinotTableName:      pinotConfig.Table,
 		resource:            resource,
 		domainCache:         domainCache,
 		config:              config,

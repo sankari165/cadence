@@ -42,10 +42,17 @@ func TestValidateQuery(t *testing.T) {
 			query:     "",
 			validated: "",
 		},
-		"Case2: simple query": {
+		"Case2-1: simple query": {
 			query:     "WorkflowID = 'wid'",
 			validated: "WorkflowID = 'wid'",
 		},
+		"Case2-2: simple query with partial match": {
+			query:     "WorkflowID like 'wid'",
+			validated: "TEXT_MATCH(WorkflowID, 'wid')",
+		},
+		"Case2-3: invalid simple query with partial match": {
+			query: "WorkflowID like wid",
+			err:   "right comparison is invalid: &{<nil> wid { }}"},
 		"Case3-1: query with custom field": {
 			query:     "CustomStringField = 'custom'",
 			validated: "(JSON_MATCH(Attr, '\"$.CustomStringField\" is not null') AND REGEXP_LIKE(JSON_EXTRACT_SCALAR(Attr, '$.CustomStringField', 'string'), 'custom*'))",
@@ -78,6 +85,10 @@ func TestValidateQuery(t *testing.T) {
 			query:     "WorkflowID = 'wid' and (CustomStringField = 'custom and custom2 or custom3 order by' or CustomIntField between 1 and 10)",
 			validated: "WorkflowID = 'wid' and ((JSON_MATCH(Attr, '\"$.CustomStringField\" is not null') AND REGEXP_LIKE(JSON_EXTRACT_SCALAR(Attr, '$.CustomStringField', 'string'), 'custom and custom2 or custom3 order by*')) or (JSON_MATCH(Attr, '\"$.CustomIntField\" is not null') AND CAST(JSON_EXTRACT_SCALAR(Attr, '$.CustomIntField') AS INT) >= 1 AND CAST(JSON_EXTRACT_SCALAR(Attr, '$.CustomIntField') AS INT) <= 10))",
 		},
+		"Case6-5: complex query with partial match": {
+			query:     "RunID like '123' or WorkflowID like '123'",
+			validated: "(TEXT_MATCH(RunID, '123') or TEXT_MATCH(WorkflowID, '123'))",
+		},
 		"Case7: invalid sql query": {
 			query: "Invalid SQL",
 			err:   "Invalid query: syntax error at position 38 near 'sql'",
@@ -89,6 +100,14 @@ func TestValidateQuery(t *testing.T) {
 		"Case8-2: query with not missing case": {
 			query:     "CloseTime != missing",
 			validated: "CloseTime != -1",
+		},
+		"Case8-3: query with custom attr": {
+			query: "CustomKeywordField = missing",
+			err:   "invalid comparison expression, right",
+		},
+		"Case8-4: query with custom keyword field not equal": {
+			query:     "CustomKeywordField != 0",
+			validated: "JSON_MATCH(Attr, '\"$.CustomKeywordField\"!=''0''') and JSON_MATCH(Attr, '\"$.CustomKeywordField[*]\"!=''0''')",
 		},
 		"Case9: invalid where expression": {
 			query: "InvalidWhereExpr",
@@ -265,7 +284,7 @@ func TestValidateQuery(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			validSearchAttr := dynamicconfig.GetMapPropertyFn(definition.GetDefaultIndexedKeys())
-			qv := NewPinotQueryValidator(validSearchAttr())
+			qv := NewPinotQueryValidator(validSearchAttr)
 			validated, err := qv.ValidateQuery(test.query)
 			if err != nil {
 				assert.Equal(t, test.err, err.Error())
@@ -298,7 +317,7 @@ func TestProcessInClause_FailedInputExprCases(t *testing.T) {
 
 	// Create a new VisibilityQueryValidator
 	validSearchAttr := dynamicconfig.GetMapPropertyFn(definition.GetDefaultIndexedKeys())
-	qv := NewPinotQueryValidator(validSearchAttr())
+	qv := NewPinotQueryValidator(validSearchAttr)
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
